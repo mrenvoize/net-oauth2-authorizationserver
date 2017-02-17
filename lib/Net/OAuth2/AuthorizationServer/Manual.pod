@@ -141,8 +141,8 @@ it should call the redirect_to method on the controller and return undef:
   my $resource_owner_confirm_scopes_sub = sub {
     my ( %args ) = @_;
 
-    my ( $obj,$client_id,$scopes_ref,$redirect_uri,$response_type )
-        = @args{ qw/ mojo_controller client_id scopes redirect_uri response_type / };
+    my ( $obj,$client_id,$scopes_ref )
+        = @args{ qw/ mojo_controller client_id scopes / };
 
     my $is_allowed = $obj->flash( "oauth_${client_id}" );
 
@@ -171,7 +171,7 @@ the caveat regarding flash and Path as documented above (L<login_resource_owner>
 =head2 login_resource_owner_cb
 
 A callback to tell the grant module if the Resource Owner is logged in. You can pass
-a hash of arguments should you need to do anything within the callback It should
+a hash of arguments should you need to do anything within the callback. It should
 return 1 if the Resource Owner is logged in, otherwise it should do the required
 things to login the resource owner (e.g. redirect) and return 0:
 
@@ -206,41 +206,73 @@ this case /oauth/login) that points to the same route as the /login route
 References: L<http://tools.ietf.org/html/rfc6749#section-4.1.1>, L<http://tools.ietf.org/html/rfc6749#section-4.2.1>, 
 L<http://tools.ietf.org/html/rfc6749#section-4.3.1>, L<http://tools.ietf.org/html/rfc6749#section-4.4.1>, 
 
-A callback to verify if the client asking for an authorization code is known
-to the Resource Server and allowed to get an authorization code for the passed
-scopes.
+A callback to verify if the client asking for authorization is known to the 
+Resource Server and allowed to get authorization for the passed scopes.
 
-The args hash should contain the client id, an array reference of request scopes,
-the redirect_uri, the response_type, and the client_secret (note not all of these
-are required depending on the grant type. The callback should return a list with
-two elements. The first element is either 1 or 0 to say that the client is allowed
-or disallowed, the second element should be the error message in the case of the
-client being disallowed:
+The args hash will always contain the B<client id> and an array reference of 
+B<requested scopes>. Additionally for a ClientCredentialsGrant the args hash
+will also contain the B<client secret> or for an ImplicitGrant B<response type>
+and optionally B<redirect uri> will be present, or for a CodeGrant B<response type> will 
+be present.
 
-  my $verify_client_sub = sub {
-    my ( %args ) = @_;
+The callback should return a list with two elements. The first element is 
+either 1 or 0 to say that the client is allowed or disallowed, the second 
+element should be the error message in the case of the client being 
+disallowed:
 
-    my ( $obj,$client_id,$scopes_ref,$redirect_uri,$response_type,$client_secret )
-        = @args{ qw/ mojo_controller client_id scopes redirect_uri response_type client_secret / };
-
-    if (
-      my $client = $obj->db->get_collection( 'clients' )
-        ->find_one({ client_id => $client_id })
-    ) {
-        foreach my $scope ( @{ $scopes_ref // [] } ) {
-
-          if ( ! exists( $client->{scopes}{$scope} ) ) {
-            return ( 0,'invalid_scope' );
-          } elsif ( ! $client->{scopes}{$scope} ) {
-            return ( 0,'access_denied' );
+  my $verify_client_sub = sub _verify_client {
+    my (%args) = @_;
+  
+    my ($c, $client_id, $scopes_ref, $client_secret, $redirect_uri, $response_type)
+      = @args{qw/mojo_controller client_id scopes client_secret redirect_uri response_type/};
+  
+    if (my $client = $c->model->rs('Oauth2Client')->find($client_id)) {
+  
+      if (!$client->active) {
+        $c->app->log->debug("Client ($client_id) is not active");
+        return (0, 'unauthorized_client');
+      }
+  
+      # Check Scopes
+      foreach my $rqd_scope (@{$scopes_ref // []}) {
+  
+        if (my $scope
+          = $c->model->rs('Oauth2ClientScope')
+          ->find({'scope.description' => $rqd_scope, 'client_id' => $client_id,}, {join => [qw/ scope /]}))
+        {
+          if (!$scope->allowed) {
+            $c->app->log->debug("Client disallowed scope ($rqd_scope)");
+            return (0, 'access_denied');
           }
         }
-
-        return ( 1 );
+        else {
+          $c->app->log->debug("Client lacks scope ($rqd_scope)");
+          return (0, 'invalid_scope');
+        }
+      }
+  
+      # ImplicitGrant Checks
+      if ($response_type && $response_type eq 'token') {
+  
+        # Check that secret is not set
+        return (0, 'unauthorized_grant') if $client->secret;
+  
+        # Check redirect_url
+        return (0, 'access_denied')
+          if ($client->redirect_uri && (!$redirect_uri || $redirect_uri ne $cleint->redirect_uri));
+      }
+  
+      # CredentialsGrant Checks
+      if ($client_secret && $client_secret ne $client->secret) {
+        return (0, 'unauthorized_client');
+      }
+  
+      return (1);
     }
-
-    return ( 0,'unauthorized_client' );
-  };
+  
+    $c->app->log->debug("Client ($client_id) does not exist");
+    return (0, 'unauthorized_client');
+  }
 
 =head2 store_auth_code_cb
 
